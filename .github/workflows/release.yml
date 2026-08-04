@@ -1,0 +1,57 @@
+name: Build & Release box-sukisu Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'version'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up variables
+        id: vars
+        run: |
+          TAG_NAME=${{ github.event.inputs.tag }}
+          VERSION=${TAG_NAME#v}
+          VERSION_CODE=$(echo $VERSION | awk -F. '{ printf("%d%02d%02d", $1,$2,$3) }')
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_ENV
+
+      - name: Zip box-sukisu module
+        run: |
+          cd box-sukisu
+          zip -r ../box-sukisu.zip ./*
+          cd ..
+
+      - name: Clean and fetch tags
+        run: |
+          git tag -l | xargs -r git tag -d
+          git fetch origin 'refs/tags/*:refs/tags/*' --force
+
+      - name: Generate CHANGELOG.md
+        run: |
+          PREV_TAG=$(git tag --sort=-creatordate | sed -n 2p)
+          if [ -z "$PREV_TAG" ]; then
+            git log --pretty=format:"* %s" > CHANGELOG.md
+          else
+            git log $PREV_TAG..HEAD --pretty=format:"* %s" > CHANGELOG.md
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: ${{ env.TAG_NAME }}
+          files: |
+            box-sukisu.zip
+            CHANGELOG.md
+          body_path: CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
