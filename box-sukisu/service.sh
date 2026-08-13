@@ -96,6 +96,15 @@ cleanupQuicBlock() {
 }
 
 startCore() {
+  if [ -f "$PID_FILE" ]; then
+    oldPid=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$oldPid" ] && kill -0 "$oldPid" 2>/dev/null; then
+      kill "$oldPid" 2>/dev/null
+      echo "旧核心已停止 (PID: $oldPid)"
+    fi
+    rm -f "$PID_FILE"
+  fi
+
   if isRunning; then
     echo "$BIN_NAME 已在运行 (PID: $(cat $PID_FILE))"
     return 0
