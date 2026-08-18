@@ -11,6 +11,7 @@ box-sukisu 通过后台运行 `/data/adb/box/bin/<bin_name>` 启动代理核心�
 ## 主要功能
 
 - 后台以 root 权限运行 mihomo / sing-box 核心
+- 支持开机自启动（安装时将 box_service.sh 注册到 service.d，开机动画结束后自动拉起核心）
 - 日志输出至 `/data/adb/box/run/core.log`，并定期轮换，防止日志过大
 - 通过 action.sh 响应用户启动/停止操作
 - 操作后自动更新 module.prop 的 description 字段，显示当前状态
