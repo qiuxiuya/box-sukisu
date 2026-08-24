@@ -14,6 +14,14 @@ LOG_FILE="$RUN_DIR/core.log"
 PID_FILE="$RUN_DIR/core.pid"
 IPV6_STATE_FILE="$RUN_DIR/ipv6_state.save"
 
+HS_MARK="50331648/50331648"
+HS_TABLE="2025"
+HS_PREF="99"
+HS_CHAIN_FWD="BOX_HS_FWD"
+HS_CHAIN_PRE="BOX_HS_PRE"
+HS_INTRANET="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+HS_INTRANET6="::1/128 fc00::/7 fe80::/10 ff00::/8 64:ff9b::/96"
+
 isRunning() {
   if [ -f "$PID_FILE" ]; then
     pid=$(cat "$PID_FILE")
@@ -27,6 +35,123 @@ isRunning() {
     fi
   fi
   return 1
+}
+
+detectTunDevice() {
+  dev=""
+  if [ "$BIN_NAME" = "sing-box" ] && [ -f "$DATA_DIR/config.json" ]; then
+    dev=$(grep -oE '"interface_name"[[:space:]]*:[[:space:]]*"[^"]+"' "$DATA_DIR/config.json" 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')
+    [ -z "$dev" ] && dev="tun0"
+  else
+    if [ -f "$DATA_DIR/config.yaml" ]; then
+      dev=$(awk '/^ *tun:/{f=1;next} f && /^[^ ]/{f=0} f && /device:/{print $2; exit}' "$DATA_DIR/config.yaml" 2>/dev/null)
+    fi
+    [ -z "$dev" ] && dev="meta"
+  fi
+  echo "$dev"
+}
+
+waitForTunDevice() {
+  _dev="$1"
+  _i=0
+  while [ "$_i" -lt 15 ]; do
+    ip link show "$_dev" >/dev/null 2>&1 && return 0
+    _i=$((_i + 1))
+    sleep 1
+  done
+  return 1
+}
+
+applyHotspotRouting() {
+  hs_dev=$(detectTunDevice)
+  echo "[热点] 等待 TUN 设备 ${hs_dev} 出现..."
+  if ! waitForTunDevice "$hs_dev"; then
+    echo "[热点] 未检测到 TUN 设备 ${hs_dev}，跳过热点路由"
+    return 1
+  fi
+
+  if ! isRunning; then
+    echo "[热点] 核心未在运行，跳过热点路由"
+    return 1
+  fi
+
+  if [ -d /proc/sys/net/ipv4 ]; then
+    cat /proc/sys/net/ipv4/ip_forward > "$RUN_DIR/ip_forward.save" 2>/dev/null
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+  fi
+
+  iptables -N "$HS_CHAIN_FWD" 2>/dev/null
+  iptables -F "$HS_CHAIN_FWD" 2>/dev/null
+  iptables -A "$HS_CHAIN_FWD" -i "$hs_dev" -j ACCEPT
+  iptables -A "$HS_CHAIN_FWD" -o "$hs_dev" -j ACCEPT
+  iptables -C FORWARD -j "$HS_CHAIN_FWD" 2>/dev/null || iptables -I FORWARD -j "$HS_CHAIN_FWD"
+
+  iptables -t mangle -N "$HS_CHAIN_PRE" 2>/dev/null
+  iptables -t mangle -F "$HS_CHAIN_PRE" 2>/dev/null
+  iptables -t mangle -A "$HS_CHAIN_PRE" -i "$hs_dev" -j RETURN
+  for subnet in $HS_INTRANET; do
+    iptables -t mangle -A "$HS_CHAIN_PRE" -d "$subnet" -j RETURN
+  done
+  iptables -t mangle -A "$HS_CHAIN_PRE" -j MARK --set-xmark $HS_MARK
+  iptables -t mangle -C PREROUTING -j "$HS_CHAIN_PRE" 2>/dev/null || iptables -t mangle -I PREROUTING -j "$HS_CHAIN_PRE"
+
+  ip rule del fwmark $HS_MARK table $HS_TABLE pref $HS_PREF 2>/dev/null
+  ip rule add fwmark $HS_MARK table $HS_TABLE pref $HS_PREF 2>/dev/null || true
+  ip route replace default dev "$hs_dev" table $HS_TABLE 2>/dev/null || true
+
+  echo "[热点] 客户端流量已通过 ${hs_dev} 导入代理"
+
+  if [ "$ipv6" = "true" ] && command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -N "$HS_CHAIN_FWD" 2>/dev/null
+    ip6tables -F "$HS_CHAIN_FWD" 2>/dev/null
+    ip6tables -A "$HS_CHAIN_FWD" -i "$hs_dev" -j ACCEPT
+    ip6tables -A "$HS_CHAIN_FWD" -o "$hs_dev" -j ACCEPT
+    ip6tables -C FORWARD -j "$HS_CHAIN_FWD" 2>/dev/null || ip6tables -I FORWARD -j "$HS_CHAIN_FWD"
+
+    ip6tables -t mangle -N "$HS_CHAIN_PRE" 2>/dev/null
+    ip6tables -t mangle -F "$HS_CHAIN_PRE" 2>/dev/null
+    ip6tables -t mangle -A "$HS_CHAIN_PRE" -i "$hs_dev" -j RETURN
+    for subnet6 in $HS_INTRANET6; do
+      ip6tables -t mangle -A "$HS_CHAIN_PRE" -d "$subnet6" -j RETURN
+    done
+    ip6tables -t mangle -A "$HS_CHAIN_PRE" -j MARK --set-xmark $HS_MARK
+    ip6tables -t mangle -C PREROUTING -j "$HS_CHAIN_PRE" 2>/dev/null || ip6tables -t mangle -I PREROUTING -j "$HS_CHAIN_PRE"
+
+    ip -6 rule del fwmark $HS_MARK table $HS_TABLE pref $HS_PREF 2>/dev/null
+    ip -6 rule add fwmark $HS_MARK table $HS_TABLE pref $HS_PREF 2>/dev/null || true
+    ip -6 route replace default dev "$hs_dev" table $HS_TABLE 2>/dev/null || true
+
+    echo "[热点] IPv6 客户端流量已通过 ${hs_dev} 导入代理"
+  fi
+}
+
+removeHotspotRouting() {
+  iptables -D FORWARD -j "$HS_CHAIN_FWD" 2>/dev/null
+  iptables -F "$HS_CHAIN_FWD" 2>/dev/null
+  iptables -X "$HS_CHAIN_FWD" 2>/dev/null
+  iptables -t mangle -D PREROUTING -j "$HS_CHAIN_PRE" 2>/dev/null
+  iptables -t mangle -F "$HS_CHAIN_PRE" 2>/dev/null
+  iptables -t mangle -X "$HS_CHAIN_PRE" 2>/dev/null
+
+  ip rule del fwmark $HS_MARK table $HS_TABLE pref $HS_PREF 2>/dev/null
+  ip route flush table $HS_TABLE 2>/dev/null
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -D FORWARD -j "$HS_CHAIN_FWD" 2>/dev/null
+    ip6tables -F "$HS_CHAIN_FWD" 2>/dev/null
+    ip6tables -X "$HS_CHAIN_FWD" 2>/dev/null
+    ip6tables -t mangle -D PREROUTING -j "$HS_CHAIN_PRE" 2>/dev/null
+    ip6tables -t mangle -F "$HS_CHAIN_PRE" 2>/dev/null
+    ip6tables -t mangle -X "$HS_CHAIN_PRE" 2>/dev/null
+
+    ip -6 rule del fwmark $HS_MARK table $HS_TABLE pref $HS_PREF 2>/dev/null
+    ip -6 route flush table $HS_TABLE 2>/dev/null
+  fi
+
+  if [ -f "$RUN_DIR/ip_forward.save" ]; then
+    cat "$RUN_DIR/ip_forward.save" > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+    rm -f "$RUN_DIR/ip_forward.save"
+  fi
 }
 
 rotateLogs() {
@@ -137,6 +262,7 @@ startCore() {
 
   applyIpv6Settings
   applyQuicBlock
+  applyHotspotRouting &
 }
 
 stopCore() {
@@ -149,6 +275,7 @@ stopCore() {
     echo "$BIN_NAME 未在运行"
   fi
 
+  removeHotspotRouting
   cleanupQuicBlock
   restoreIpv6Settings
 }
