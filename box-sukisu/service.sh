@@ -15,11 +15,28 @@ PID_FILE="$RUN_DIR/core.pid"
 IPV6_STATE_FILE="$RUN_DIR/ipv6_state.save"
 HS_LOG_FILE="$RUN_DIR/hotspot.log"
 
+hotspotEnabled() {
+  [ "$hotspot" != "false" ]
+}
+
 HS_MARK="50331648/50331648"
 HS_TABLE="2025"
 HS_PREF="99"
 HS_CHAIN_FWD="BOX_HS_FWD"
 HS_CHAIN_PRE="BOX_HS_PRE"
+
+HS_BYPASS_MARK="67108864/67108864"
+HS_BYPASS_TABLE="2026"
+HS_BYPASS_PREF="98"
+HS_CHAIN_BYPASS="BOX_HS_BYPASS"
+
+detectWanIface() {
+  ip -4 route show default 2>/dev/null | busybox awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+detectWanIface6() {
+  ip -6 route show default 2>/dev/null | busybox awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' | head -n 1
+}
 HS_INTRANET="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
 HS_INTRANET6="::1/128 fc00::/7 fe80::/10 ff00::/8 64:ff9b::/96"
 
@@ -66,11 +83,70 @@ waitForTunDevice() {
   return 1
 }
 
+applyHotspotBypass() {
+  hs_log "hotspot=false：开始下发热点绕过规则"
+
+  if [ ! -d /proc/sys/net/ipv4 ]; then
+    hs_log "未找到 IPv4 支持，跳过热点绕过"
+    return 1
+  fi
+
+  wan=$(detectWanIface)
+  if [ -z "$wan" ]; then
+    hs_log "未检测到默认出口接口，跳过热点绕过"
+    return 1
+  fi
+
+  cat /proc/sys/net/ipv4/ip_forward > "$RUN_DIR/ip_forward.save" 2>/dev/null
+  echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+
+  iptables -t mangle -N "$HS_CHAIN_BYPASS" 2>/dev/null
+  iptables -t mangle -F "$HS_CHAIN_BYPASS" 2>/dev/null
+  iptables -t mangle -A "$HS_CHAIN_BYPASS" -o "$wan" -j RETURN
+  iptables -t mangle -A "$HS_CHAIN_BYPASS" -j MARK --set-xmark $HS_BYPASS_MARK
+  iptables -t mangle -C PREROUTING -j "$HS_CHAIN_BYPASS" 2>/dev/null || iptables -t mangle -I PREROUTING -j "$HS_CHAIN_BYPASS"
+
+  ip rule del fwmark $HS_BYPASS_MARK table $HS_BYPASS_TABLE pref $HS_BYPASS_PREF 2>/dev/null
+  ip rule add fwmark $HS_BYPASS_MARK table $HS_BYPASS_TABLE pref $HS_BYPASS_PREF 2>/dev/null || true
+  ip route replace default dev "$wan" table $HS_BYPASS_TABLE 2>/dev/null || true
+
+  hs_log "IPv4 热点流量已通过 ${wan} 直接出站（绕过 TUN）"
+
+  if [ "$ipv6" = "true" ] && command -v ip6tables >/dev/null 2>&1; then
+    wan6=$(detectWanIface6)
+    if [ -n "$wan6" ]; then
+      ip6tables -N "$HS_CHAIN_FWD" 2>/dev/null
+      ip6tables -F "$HS_CHAIN_FWD" 2>/dev/null
+      ip6tables -C FORWARD -j "$HS_CHAIN_FWD" 2>/dev/null || ip6tables -I FORWARD -j "$HS_CHAIN_FWD"
+
+      ip6tables -t mangle -N "$HS_CHAIN_BYPASS" 2>/dev/null
+      ip6tables -t mangle -F "$HS_CHAIN_BYPASS" 2>/dev/null
+      ip6tables -t mangle -A "$HS_CHAIN_BYPASS" -o "$wan6" -j RETURN
+      ip6tables -t mangle -A "$HS_CHAIN_BYPASS" -j MARK --set-xmark $HS_BYPASS_MARK
+      ip6tables -t mangle -C PREROUTING -j "$HS_CHAIN_BYPASS" 2>/dev/null || ip6tables -t mangle -I PREROUTING -j "$HS_CHAIN_BYPASS"
+
+      ip -6 rule del fwmark $HS_BYPASS_MARK table $HS_BYPASS_TABLE pref $HS_BYPASS_PREF 2>/dev/null
+      ip -6 rule add fwmark $HS_BYPASS_MARK table $HS_BYPASS_TABLE pref $HS_BYPASS_PREF 2>/dev/null || true
+      ip -6 route replace default dev "$wan6" table $HS_BYPASS_TABLE 2>/dev/null || true
+
+      hs_log "IPv6 热点流量已通过 ${wan6} 直接出站（绕过 TUN）"
+    else
+      hs_log "未检测到 IPv6 默认出口，跳过 IPv6 绕过规则"
+    fi
+  fi
+}
+
 applyHotspotRouting() {
   : > "$HS_LOG_FILE" 2>/dev/null
+
+  if ! hotspotEnabled; then
+    applyHotspotBypass
+    return $?
+  fi
+
   hs_dev=$(detectTunDevice)
   hs_log "从配置读取的 TUN 设备名: ${hs_dev}"
-  if ! waitForTunDevice "$hs_dev" "hs_dev"; then
+  if ! waitForTunDevice "$hs_dev"; then
     hs_log "未检测到 TUN 设备 ${hs_dev}，跳过热点路由"
     return 1
   fi
@@ -141,7 +217,13 @@ removeHotspotRouting() {
   iptables -t mangle -X "$HS_CHAIN_PRE" 2>/dev/null
 
   ip rule del fwmark $HS_MARK table $HS_TABLE pref $HS_PREF 2>/dev/null
+  ip rule del fwmark $HS_BYPASS_MARK table $HS_BYPASS_TABLE pref $HS_BYPASS_PREF 2>/dev/null
   ip route flush table $HS_TABLE 2>/dev/null
+  ip route flush table $HS_BYPASS_TABLE 2>/dev/null
+
+  iptables -t mangle -D PREROUTING -j "$HS_CHAIN_BYPASS" 2>/dev/null
+  iptables -t mangle -F "$HS_CHAIN_BYPASS" 2>/dev/null
+  iptables -t mangle -X "$HS_CHAIN_BYPASS" 2>/dev/null
 
   if command -v ip6tables >/dev/null 2>&1; then
     ip6tables -D FORWARD -j "$HS_CHAIN_FWD" 2>/dev/null
@@ -151,8 +233,14 @@ removeHotspotRouting() {
     ip6tables -t mangle -F "$HS_CHAIN_PRE" 2>/dev/null
     ip6tables -t mangle -X "$HS_CHAIN_PRE" 2>/dev/null
 
+    ip6tables -t mangle -D PREROUTING -j "$HS_CHAIN_BYPASS" 2>/dev/null
+    ip6tables -t mangle -F "$HS_CHAIN_BYPASS" 2>/dev/null
+    ip6tables -t mangle -X "$HS_CHAIN_BYPASS" 2>/dev/null
+
     ip -6 rule del fwmark $HS_MARK table $HS_TABLE pref $HS_PREF 2>/dev/null
+    ip -6 rule del fwmark $HS_BYPASS_MARK table $HS_BYPASS_TABLE pref $HS_BYPASS_PREF 2>/dev/null
     ip -6 route flush table $HS_TABLE 2>/dev/null
+    ip -6 route flush table $HS_BYPASS_TABLE 2>/dev/null
   fi
 
   if [ -f "$RUN_DIR/ip_forward.save" ]; then
