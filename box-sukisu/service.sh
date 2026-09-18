@@ -137,7 +137,6 @@ applyHotspotBypass() {
 }
 
 applyHotspotRouting() {
-  : > "$HS_LOG_FILE" 2>/dev/null
 
   if ! hotspotEnabled; then
     applyHotspotBypass
@@ -247,6 +246,22 @@ removeHotspotRouting() {
     cat "$RUN_DIR/ip_forward.save" > /proc/sys/net/ipv4/ip_forward 2>/dev/null
     rm -f "$RUN_DIR/ip_forward.save"
   fi
+
+  if [ -f "$RUN_DIR/original_wan.save" ]; then
+    wan=$(cat "$RUN_DIR/original_wan.save")
+    if [ -n "$wan" ] && [ -d /proc/sys/net/ipv4 ]; then
+        ip route replace default dev "$wan" table main 2>/dev/null || true
+    fi
+    rm -f "$RUN_DIR/original_wan.save"
+  fi
+
+  if [ -f "$RUN_DIR/original_wan6.save" ]; then
+    wan6=$(cat "$RUN_DIR/original_wan6.save")
+    if [ -n "$wan6" ]; then
+        ip -6 route replace default dev "$wan6" table main 2>/dev/null || true
+    fi
+    rm -f "$RUN_DIR/original_wan6.save"
+  fi
 }
 
 rotateLogs() {
@@ -354,9 +369,22 @@ startCore() {
 
   echo $! > "$PID_FILE"
   echo "$BIN_NAME 已启动 (PID: $(cat $PID_FILE))"
+  echo "IPv6 $ipv6"
+
+  if [ "$hotspot" = "true" ]; then
+    echo "代理热点 true"
+  else
+    echo "代理热点 false"
+  fi
 
   applyIpv6Settings
   applyQuicBlock
+  original_wan=$(detectWanIface)
+  echo "$original_wan" > "$RUN_DIR/original_wan.save"
+  if [ "$ipv6" = "true" ]; then
+      original_wan6=$(detectWanIface6)
+      echo "$original_wan6" > "$RUN_DIR/original_wan6.save"
+  fi
   applyHotspotRouting &
 }
 
