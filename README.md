@@ -40,6 +40,17 @@ ipv6="true"         # true / false
 quic="false"        # true / false
 ```
 
+## 热点代理与默认路由
+
+启用热点代理（`hotspot="true"`）后，核心会接管本机默认路由，并在 `main` 表中留下指向 TUN 设备的默认路由（如 `default dev meta`）。核心进程一旦退出，这些路由仍然存在，而 TUN 设备已消失，导致关闭核心后设备“没网”。
+
+为此模块在启动核心前会把 `main` 表中的原始默认路由完整保存到 `/data/adb/box/run/original_route4.save` 与 `original_route6.save`，停止核心时：
+
+1. 删除 `main` 表中所有指向 TUN 的残留默认路由；
+2. 按保存内容恢复原始默认路由，保证核心关闭后网络立即可用。
+
+因此请通过 action.sh 或 `service.sh stop` 正常停止核心，不要直接 `kill` 核心进程，否则路由不会被清理。
+
 ## 注意事项
 
 - **请勿直接操作 `/data/adb/box` 路径**，该路径属于 box4magisk 模块，直接操作可能让 box4magisk 模块无法正常使用。

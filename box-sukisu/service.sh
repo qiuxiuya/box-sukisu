@@ -83,6 +83,58 @@ waitForTunDevice() {
   return 1
 }
 
+saveOriginalRoutes() {
+  mkdir -p "$RUN_DIR" >/dev/null 2>&1
+
+  ip -4 route show default table main > "$RUN_DIR/original_route4.save" 2>/dev/null
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip -6 route show default table main > "$RUN_DIR/original_route6.save" 2>/dev/null
+  fi
+
+  hs_log "已保存原始默认路由："
+  [ -s "$RUN_DIR/original_route4.save" ] && while IFS= read -r _l; do hs_log "  v4: $_l"; done < "$RUN_DIR/original_route4.save"
+  [ -s "$RUN_DIR/original_route6.save" ] && while IFS= read -r _l; do hs_log "  v6: $_l"; done < "$RUN_DIR/original_route6.save"
+}
+
+removeTunDefaultRoutes() {
+  _dev=$(detectTunDevice)
+  [ -z "$_dev" ] && return 0
+
+  ip -4 route show default table main 2>/dev/null | grep -E "dev ${_dev}([[:space:]]|\$)" | while IFS= read -r line; do
+    [ -n "$line" ] && ip -4 route del $line 2>/dev/null
+  done
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip -6 route show default table main 2>/dev/null | grep -E "dev ${_dev}([[:space:]]|\$)" | while IFS= read -r line; do
+      [ -n "$line" ] && ip -6 route del $line 2>/dev/null
+    done
+  fi
+}
+
+restoreOriginalRoutes() {
+  # 先清理 main 表中指向 TUN 的残留默认路由（核心退出后这些路由已失效）
+  removeTunDefaultRoutes
+
+  save4="$RUN_DIR/original_route4.save"
+  if [ -s "$save4" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && ip -4 route replace $line 2>/dev/null
+    done < "$save4"
+    rm -f "$save4"
+    hs_log "IPv4 默认路由已恢复"
+  fi
+
+  save6="$RUN_DIR/original_route6.save"
+  if [ -s "$save6" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && ip -6 route replace $line 2>/dev/null
+    done < "$save6"
+    rm -f "$save6"
+    hs_log "IPv6 默认路由已恢复"
+  fi
+}
+
 applyHotspotBypass() {
   hs_log "hotspot=false：开始下发热点绕过规则"
 
@@ -208,6 +260,9 @@ applyHotspotRouting() {
 }
 
 removeHotspotRouting() {
+  # 清理旧版本遗留的出口接口记录（可能为空或已被 TUN 替换，不再使用）
+  rm -f "$RUN_DIR/original_wan.save" "$RUN_DIR/original_wan6.save"
+
   iptables -D FORWARD -j "$HS_CHAIN_FWD" 2>/dev/null
   iptables -F "$HS_CHAIN_FWD" 2>/dev/null
   iptables -X "$HS_CHAIN_FWD" 2>/dev/null
@@ -247,21 +302,7 @@ removeHotspotRouting() {
     rm -f "$RUN_DIR/ip_forward.save"
   fi
 
-  if [ -f "$RUN_DIR/original_wan.save" ]; then
-    wan=$(cat "$RUN_DIR/original_wan.save")
-    if [ -n "$wan" ] && [ -d /proc/sys/net/ipv4 ]; then
-        ip route replace default dev "$wan" table main 2>/dev/null || true
-    fi
-    rm -f "$RUN_DIR/original_wan.save"
-  fi
-
-  if [ -f "$RUN_DIR/original_wan6.save" ]; then
-    wan6=$(cat "$RUN_DIR/original_wan6.save")
-    if [ -n "$wan6" ]; then
-        ip -6 route replace default dev "$wan6" table main 2>/dev/null || true
-    fi
-    rm -f "$RUN_DIR/original_wan6.save"
-  fi
+  restoreOriginalRoutes
 }
 
 rotateLogs() {
@@ -374,12 +415,7 @@ startCore() {
 
   applyIpv6Settings
   applyQuicBlock
-  original_wan=$(detectWanIface)
-  echo "$original_wan" > "$RUN_DIR/original_wan.save"
-  if [ "$ipv6" = "true" ]; then
-      original_wan6=$(detectWanIface6)
-      echo "$original_wan6" > "$RUN_DIR/original_wan6.save"
-  fi
+  saveOriginalRoutes
   applyHotspotRouting &
 }
 
