@@ -14,6 +14,9 @@ LOG_FILE="$RUN_DIR/core.log"
 PID_FILE="$RUN_DIR/core.pid"
 IPV6_STATE_FILE="$RUN_DIR/ipv6_state.save"
 HS_LOG_FILE="$RUN_DIR/hotspot.log"
+# 热点路由后台任务守卫：stopCore 先删除守卫文件，后台任务检测到即中止，避免清理后残留规则
+HS_GUARD_FILE="$RUN_DIR/hotspot.enable"
+HS_BG_PID_FILE="$RUN_DIR/hotspot.pid"
 
 hotspotEnabled() {
   [ "$hotspot" != "false" ]
@@ -76,6 +79,8 @@ waitForTunDevice() {
   _dev="$1"
   _i=0
   while [ "$_i" -lt 20 ]; do
+    # 等待期间响应停止信号，避免停止核心后后台任务继续写规则
+    [ -f "$HS_GUARD_FILE" ] || return 2
     ip link show "$_dev" >/dev/null 2>&1 && return 0
     _i=$((_i + 1))
     sleep 1
@@ -97,7 +102,8 @@ applyHotspotBypass() {
     return 1
   fi
 
-  cat /proc/sys/net/ipv4/ip_forward > "$RUN_DIR/ip_forward.save" 2>/dev/null
+  # 借鉴 box-1.2.8：只将 ip_forward 置 1，不保存旧值。
+  # Android netd 仅在热点开/关事件时设置该值，恢复旧值(可能为0)会切断热点转发。
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
 
   iptables -t mangle -N "$HS_CHAIN_BYPASS" 2>/dev/null
@@ -146,7 +152,13 @@ applyHotspotRouting() {
 
   hs_dev=$(detectTunDevice)
   hs_log "从配置读取的 TUN 设备名: ${hs_dev}"
-  if ! waitForTunDevice "$hs_dev"; then
+  waitForTunDevice "$hs_dev"
+  _wait_rv=$?
+  if [ "$_wait_rv" = "2" ]; then
+    hs_log "检测到停止信号，中止热点路由下发"
+    return 1
+  fi
+  if [ "$_wait_rv" != "0" ]; then
     hs_log "未检测到 TUN 设备 ${hs_dev}，跳过热点路由"
     return 1
   fi
@@ -156,8 +168,14 @@ applyHotspotRouting() {
     return 1
   fi
 
+  # 写规则前最后确认未被停止，消除与 stopCore 的竞态
+  if [ ! -f "$HS_GUARD_FILE" ]; then
+    hs_log "检测到停止信号，跳过热点路由"
+    return 1
+  fi
+
+  # 借鉴 box-1.2.8：只将 ip_forward 置 1，不保存旧值。
   if [ -d /proc/sys/net/ipv4 ]; then
-    cat /proc/sys/net/ipv4/ip_forward > "$RUN_DIR/ip_forward.save" 2>/dev/null
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
   fi
 
@@ -243,10 +261,10 @@ removeHotspotRouting() {
     ip -6 route flush table $HS_BYPASS_TABLE 2>/dev/null
   fi
 
-  if [ -f "$RUN_DIR/ip_forward.save" ]; then
-    cat "$RUN_DIR/ip_forward.save" > /proc/sys/net/ipv4/ip_forward 2>/dev/null
-    rm -f "$RUN_DIR/ip_forward.save"
-  fi
+  # 借鉴 box-1.2.8：不恢复 ip_forward（box.iptables 的 forward() 清理时同样不回退）。
+  # Android netd 仅在热点开/关事件时设置该值；若核心启动早于热点开启，保存值可能为 0，
+  # 停止核心时恢复 0 会导致热点转发瘫痪、客户端全部断网。
+  rm -f "$RUN_DIR/ip_forward.save"
 }
 
 rotateLogs() {
@@ -357,19 +375,57 @@ startCore() {
 
   applyIpv6Settings
   applyQuicBlock
+
+  # 先立守卫再异步下发热点路由，并记录后台任务 PID 供 stopCore 等待
+  : > "$HS_GUARD_FILE"
   applyHotspotRouting &
+  echo $! > "$HS_BG_PID_FILE" 2>/dev/null
+}
+
+# 等待热点路由后台任务退出（跨进程通过 PID 文件），避免清理与写入竞态
+waitHotspotBgExit() {
+  [ -f "$HS_BG_PID_FILE" ] || return 0
+  _bg_pid=$(cat "$HS_BG_PID_FILE" 2>/dev/null)
+  [ -n "$_bg_pid" ] || { rm -f "$HS_BG_PID_FILE"; return 0; }
+  _i=0
+  while [ "$_i" -lt 25 ]; do
+    kill -0 "$_bg_pid" 2>/dev/null || break
+    sleep 0.2
+    _i=$((_i + 1))
+  done
+  rm -f "$HS_BG_PID_FILE"
 }
 
 stopCore() {
+  # 1) 先撤销守卫并等待后台热点任务退出，防止规则被清理后又被写入
+  rm -f "$HS_GUARD_FILE"
+  waitHotspotBgExit
+
+  # 2) 借鉴 box-1.2.8 停止流程（先 box.iptables disable 再停核心）：
+  #    先清理热点转发/标记规则，恢复客户端直连，避免"TUN 已消失但规则仍在"的断网空窗
+  removeHotspotRouting
+
+  # 3) 停止核心：优雅退出超时后强杀，确保 TUN 与核心 auto-route 被可靠回收
   if isRunning; then
     pid=$(cat "$PID_FILE")
     kill "$pid" 2>/dev/null
+    _i=0
+    while [ "$_i" -lt 10 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+      _i=$((_i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null
+      echo "$BIN_NAME 未响应，已强制结束 (PID: $pid)"
+    fi
     rm -f "$PID_FILE"
     echo "$BIN_NAME 已停止"
   else
     echo "$BIN_NAME 未在运行"
   fi
 
+  # 4) 兜底再次清理热点规则与系统设置
   removeHotspotRouting
   cleanupQuicBlock
   restoreIpv6Settings
